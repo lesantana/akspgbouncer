@@ -1,0 +1,174 @@
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: psql
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: psql
+  template:
+    metadata:
+      labels:
+        app: psql
+    spec:
+      containers:
+      - name: psql
+        image: andreandradeact/psql:1.6
+        livenessProbe:
+          tcpSocket:
+            port: 5432
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        volumeMounts:
+        - name: secrets-kv               #[]
+          mountPath: "/mnt/secrets-kv"
+          readOnly: true
+        env:
+        - name: PSQL_USER
+          valueFrom:
+            secretKeyRef:
+              name: secret-kvpsql
+              key: k8s-secret-kvpsqluser
+        - name: PSQL_PORT
+          value: "5432"
+        - name: PGPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: secret-kvpsql
+              key: k8s-secret-kvpsqlpass
+        - name: PSQL_DB
+          value: "postgres"
+      - name: azure-pgbouncer-sidecar
+        image: mcr.microsoft.com/azure-oss-db-tools/pgbouncer-sidecar:latest
+      # Uncomment below if you always want the latest version
+      # imagePullPolicy: Always
+        resources:
+          limits:
+            memory: "128Mi"
+            cpu: "500m"
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - name: pgfileshare
+          mountPath: "/etc/pgbouncer"
+          readOnly: true
+        - name: secrets-kv
+          mountPath: "/etc/pgbouncer_sec"
+          readOnly: true   
+        livenessProbe:
+           tcpSocket:
+          # This must match the port your applications use to talk to postgres
+             port: 5432
+           periodSeconds: 60
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "killall -INT pgbouncer && sleep 120"]
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ['all']
+      volumes:   ## Mapping Secret Provider Class in the Pod
+      - name: secrets-kv
+        csi:
+          driver: secrets-store.csi.k8s.io
+          readOnly: true
+          volumeAttributes:
+            secretProviderClass: "pgsidecar-spc"
+      - name: pgfileshare
+        persistentVolumeClaim:
+          claimName: pgsidecar-pvc 
+---
+# This is a SecretProviderClass example using user-assigned identity to access your key vault
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: pgsidecar-spc
+spec:
+  provider: azure
+  parameters:
+    usePodIdentity: "false"
+    useVMManagedIdentity: "true"          # Set to true for using managed identity
+    userAssignedIdentityID: <replace-with-azureKeyvaultSecretsProviderIdentity>   # Set the clientID of the user-assigned managed identity to use
+    keyvaultName: kvpgsidecar        # Set to the name of your key vault
+    cloudName: ""                         # [OPTIONAL for Azure] if not provided, the Azure environment defaults to AzurePublicCloud
+    objects:  |
+      array:
+        - |
+          objectName: kvpguserslist       
+          objectType: secret
+          objectVersion: ""
+        - |
+          objectName: kvpsqluser
+          objectType: secret
+          objectVersion: ""
+        - |
+          objectName: kvpsqlpass
+          objectType: secret
+          objectVersion: ""
+        - |
+          objectName: kvazurestorageaccountname
+          objectType: secret
+          objectVersion: ""
+        - |
+          objectName: kvazurestorageaccountkey
+          objectType: secret
+          objectVersion: ""
+    tenantId: <replace-with-tenant-id>                 # The tenant ID of the key vault
+  secretObjects:                              # [OPTIONAL] SecretObjects defines the desired state of synced Kubernetes secret objects
+  - data:
+    - key: k8s-secret-kvpsqluser              # data field to populate
+      objectName: kvpsqluser                  # name of the mounted content to sync; this could be the object name or the object alias
+    - key: k8s-secret-kvpsqlpass              # data field to populate
+      objectName: kvpsqlpass                  # name of the mounted content to sync; this could be the object name or the object alias
+    - key: azurestorageaccountname            # data field to populate
+      objectName: kvazurestorageaccountname     # name of the mounted content to sync; this could be the object name or the object alias
+    - key: azurestorageaccountkey             # data field to populate
+      objectName: kvazurestorageaccountkey      # name of the mounted content to sync; this could be the object name or the object alias
+    secretName: secret-kvpsql                 # name of the Kubernetes secret object
+    type: Opaque                              # type of Kubernetes secret object (for example, Opaque, kubernetes.io/tls)
+---
+apiVersion: v1
+kind: PersistentVolume #to allocate the physical storage volume
+metadata:
+  name: pgsidecar-pv # Storage account file share name 
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes:
+    - ReadOnlyMany # Not allow write on this volume. Pgbouncer.ini should be unchanged. 
+  persistentVolumeReclaimPolicy: Retain
+  csi:
+    driver: file.csi.azure.com
+    readOnly: false
+    volumeHandle: 7f48d3fd-3e9b-45c4-a81e-8cd23664c9d0  # make sure this volumeid is unique in the cluster // You can use https://www.uuidgenerator.net/ to get a unique hash;
+    volumeAttributes:
+      resourceGroup: pgbouncer-aks  # optional, only set this when storage account is not in the same resource group as agent node
+      shareName: fspgfiles # file share name 
+    nodeStageSecretRef:
+      name: secret-kvpsql #  put the name of the secret that you created in the aks cluster.
+      namespace: default 
+  mountOptions:
+    - dir_mode=0777
+    - file_mode=0777
+    - uid=0
+    - gid=0
+    - mfsymlinks
+    - cache=strict
+    - nosharesock
+    - nobrl
+---
+apiVersion: v1
+kind: PersistentVolumeClaim # to ingreate the pod with the persistent volume.
+metadata:
+  name: pgsidecar-pvc
+spec:
+  accessModes:
+    - ReadOnlyMany
+  storageClassName: ""
+  volumeName: pgsidecar-pv
+  resources:
+    requests:
+      storage: 5Gi
